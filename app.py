@@ -1,209 +1,175 @@
+# app.py 
 
 import streamlit as st
+import ollama
 import os
-import sys
-from datetime import datetime
+from rag_handler import create_or_load_rag_index, get_relevant_context
+from function_caller import get_intent, search_web
+from game_logic import Game20Q
 
-# Add the current directory to the path so we can import our modules
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# --- Page Configuration ---
+st.set_page_config(page_title="AI Chat Agent", page_icon="🤖", layout="wide")
+st.title("🤖 AI Chat Agent Project")
+st.caption("A Deep Learning Project from Sharif University of Technology")
 
-from ai_chat_agent import AIChatAgent
-import requests
+# --- State Management ---
+if "messages" not in st.session_state:
+    st.session_state.messages = [{"role": "system", "content": "You are a helpful and conversational AI assistant. Remember and use information from previous turns in the conversation."}]
+if "rag_db" not in st.session_state:
+    st.session_state.rag_db = None
+if "game_mode" not in st.session_state:
+    st.session_state.game_mode = False
+if "game" not in st.session_state:
+    st.session_state.game = Game20Q()
+# New state to manage the turn-based logic of the 20 Questions game
+if "game_turn_state" not in st.session_state:
+    st.session_state.game_turn_state = "START" # States: START, AWAITING_QUESTION_ANSWER, AWAITING_GUESS_ANSWER
 
-def notify_slack(text: str):
-    webhook = os.getenv("SLACK_WEBHOOK_URL")
-    if not webhook: return
-    try:
-        requests.post(webhook, json={"text": text}, timeout=5)
-    except Exception:
-        pass
+# --- Helper Functions ---
+def reset_conversation():
+    """Resets the chat history and game state."""
+    st.session_state.messages = [{"role": "system", "content": "You are a helpful and conversational AI assistant."}]
+    st.session_state.game_mode = False
+    st.session_state.game.reset()
+    st.session_state.game_turn_state = "START"
+    st.success("Conversation and game state have been reset!")
 
+def generate_chat_response(history, latest_prompt, context=""):
+    """Generates a response for standard chat and RAG, using conversation history."""
+    messages_for_api = list(history)
+    full_prompt = f"Use the following context if relevant:\n---\n{context}\n---\n\nUser Query: {latest_prompt}" if context else latest_prompt
+    messages_for_api.append({"role": "user", "content": full_prompt})
+    
+    response = ollama.chat(model='mistral', messages=messages_for_api)
+    return response['message']['content']
 
+# --- Sidebar ---
+with st.sidebar:
+    st.header("Controls & Settings")
+    st.subheader("📄 RAG Document")
+    uploaded_file = st.file_uploader("Upload a PDF to chat with it", type="pdf")
+    if uploaded_file is not None:
+        # Simple caching mechanism
+        if "last_uploaded_filename" not in st.session_state or st.session_state.last_uploaded_filename != uploaded_file.name:
+            st.session_state.last_uploaded_filename = uploaded_file.name
+            with open("temp_doc.pdf", "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            with st.spinner("Processing PDF... This may take a moment."):
+                st.session_state.rag_db = create_or_load_rag_index("temp_doc.pdf")
+            st.success("PDF processed successfully!")
+        elif st.session_state.rag_db is None:
+             st.session_state.rag_db = create_or_load_rag_index("temp_doc.pdf")
 
-
-def initialize_session_state():
-    """Initialize Streamlit session state variables"""
-    if 'chat_agent' not in st.session_state:
-        st.session_state.chat_agent = AIChatAgent()
-        st.session_state.chat_agent.web_search.exa_api_key = "14f915e9-2fcb-4b59-b839-c027be34d922"
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
-   
-    if 'pdf_processed' not in st.session_state:
-        st.session_state.pdf_processed = False
-def main():
-    st.set_page_config(
-        page_title="AI Chat Agent",
-        page_icon="🤖",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-   
-    # Initialize session state
-    initialize_session_state()
-   
-    # Sidebar for configuration and file upload
-    with st.sidebar:
-
-       
-        # PDF Upload Section
-        st.subheader("📄 Document Upload")
-        uploaded_file = st.file_uploader(
-            "Upload a PDF document for RAG",
-            type="pdf",
-            help="Upload a PDF to enable document-based question answering"
-        )
-       
-        if uploaded_file is not None:
-            if st.button("Process PDF"):
-                with st.spinner("Processing PDF..."):
-                    success = st.session_state.chat_agent.rag_system.process_pdf(uploaded_file)
-                    if success:
-                        st.session_state.pdf_processed = True
-                        st.success("PDF processed successfully!")
-                    else:
-                        st.error("Failed to process PDF")
-       
-        if st.session_state.pdf_processed:
-            st.success("✅ PDF is loaded and ready for questions")
-       
-        st.divider()
-       
-        # Game Status
-        st.subheader("🎮 Game Status")
-        if st.session_state.chat_agent.game.game_active:
-            st.info(f"🎯 20 Questions Game Active")
-            st.write(f"Question: {st.session_state.chat_agent.game.question_count}/20")
-            if st.button("End Game"):
-                response = st.session_state.chat_agent.game.end_game("ended")
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": response,
-                    "timestamp": datetime.now()
-                })
-                st.rerun()
-        else:
-            st.write("No active game")
-            if st.button("Start 20 Questions"):
-                response = st.session_state.chat_agent.game.start_game()
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": response,
-                    "timestamp": datetime.now()
-                })
-                st.rerun()
-       
-        st.divider()
-       
-        # Clear Chat
-        if st.button("🗑️ Clear Chat", type="secondary"):
-            st.session_state.messages = []
-            st.session_state.chat_agent.conversation_manager.clear_history()
-            st.session_state.chat_agent.game.reset_game()
-            st.rerun()
-   
-    # Main chat interface
-    st.title("🤖 AI Chat Agent")
-    st.write("A comprehensive AI assistant with conversation memory, RAG, web search, and 20 Questions game!")
-   
-    # Display feature status
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("💬 Conversation", "Active", delta="Memory enabled")
-    with col2:
-        status = "Ready" if st.session_state.pdf_processed else "No PDF"
-        st.metric("📚 RAG System", status)
-    with col3:
-        web_status = "Ready" 
-        st.metric("🌐 Web Search", web_status)
-    with col4:
-        game_status = "Playing" if st.session_state.chat_agent.game.game_active else "Ready"
-        st.metric("🎮 20 Questions", game_status)
-   
     st.divider()
-   
-    # Chat messages display
-    chat_container = st.container()
-    with chat_container:
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.write(message["content"])
-                if "timestamp" in message:
-                    st.caption(f"Time: {message['timestamp'].strftime('%H:%M:%S')}")
-   
-    # Chat input
-    if prompt := st.chat_input("Type your message here..."):
-        # Add user message to display
-        st.session_state.messages.append({
-            "role": "user",
-            "content": prompt,
-            "timestamp": datetime.now()
-        })
-       
-        # Display user message immediately
-        with st.chat_message("user"):
-            st.write(prompt)
-            st.caption(f"Time: {datetime.now().strftime('%H:%M:%S')}")
-       
-        # Process message and get response
-        with st.spinner("Thinking..."):
-            response = st.session_state.chat_agent.process_message(prompt)
-            notify_slack(f"✅ Chatbot replied at {datetime.now().isoformat()}:\n{response[:400]}")
+    st.button("Clear Chat History", on_click=reset_conversation)
 
-        # Add assistant response to display
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": response,
-            "timestamp": datetime.now()
-        })
-       
-        # Display assistant response
-        with st.chat_message("assistant"):
-            st.write(response)
-            st.caption(f"Time: {datetime.now().strftime('%H:%M:%S')}")
-       
-        # Rerun to update the display
-        st.rerun()
-   
-    # Instructions and examples
-    with st.expander("📝 How to Use"):
-        st.write("""
-        **Available Features:**
-       
-        1. **💬 Natural Conversation**: Just chat naturally - the agent remembers our conversation!
-       
-        2. **📚 Document Q&A**: Upload a PDF in the sidebar and ask questions about its content.
-       
-        3. **🌐 Web Search**: Ask about current events, news, weather, prices, etc.
-           - Examples: "What's the latest news?", "Current weather", "Stock prices"
-       
-        4. **🎮 20 Questions Game**: Say "play game" or "20 questions" to start.
-           - Think of a word and answer yes/no to my questions!
-       
-        **Example Queries:**
-        - "Hello, how are you?"
-        - "What's in the uploaded document about machine learning?"
-        - "What's the latest news about AI?"
-        - "Let's play 20 questions!"
-        - "What's the weather like today?"
-        """)
-   
-    # Technical details
-    with st.expander("🔧 Technical Details"):
-        st.write("""
-        **System Components:**
-        - **LLM**: Mistral 7B via Ollama (can be configured for other models up to 7B parameters)
-        - **RAG**: FAISS + SentenceTransformers for document retrieval
-        - **Web Search**: EXA API integration
-        - **Embeddings**: all-MiniLM-L6-v2 for document processing
-        - **Context Management**: Automatic conversation history management
-       
-        **Architecture:**
-        - Modular design with separate classes for each functionality
-        - Streamlit-based user interface
-        - Memory-efficient context window management
-        - Real-time response generation
-        """)
+# --- Main Chat Interface ---
+# Display chat messages from history
+for message in st.session_state.messages:
+    if message["role"] != "system":
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-if __name__ == "__main__":
-    main()
+import re
+# Handle user input
+if prompt := st.chat_input("What is up?"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        response = ""
+        # ------------------------------------------------------------------
+        # --- 20 Questions Game Logic ---
+        # ------------------------------------------------------------------
+        if st.session_state.game_mode:
+            game = st.session_state.game
+            if(re.search(r"\b(quit|exit|cancel|stop|end game)\b",
+                              prompt, flags = re.I)):
+                # Reset game state for the next time
+                    st.session_state.game_mode = False
+                    st.session_state.game_turn_state = "START"
+                    game.reset()
+
+            # State 1: User has just agreed to play. Bot asks the first question.
+            if st.session_state.game_turn_state == "START":
+                with st.spinner("I'm thinking of my first question..."):
+
+                    question = game.generate_question()
+                    st.session_state.current_question = question
+                    response = f"Great! Let's begin.\n\n**Question {game.questions_asked + 1}:** {question}"
+                    st.session_state.game_turn_state = "AWAITING_QUESTION_ANSWER"
+
+            # State 2: Bot has asked a question, user's prompt is the answer.
+            elif st.session_state.game_turn_state == "AWAITING_QUESTION_ANSWER":
+                st.session_state.last_answer = prompt  # Save the answer to the question
+                current_guess =  game.generate_guess(st.session_state.current_question, st.session_state.last_answer)
+                st.session_state.current_guess = current_guess
+                response = f"Got it. Now, is the word you're thinking of **'{current_guess}'**? (yes/no)"
+                st.session_state.game_turn_state = "AWAITING_GUESS_ANSWER"
+
+            # State 3: Bot is waiting for guess validation.
+            elif st.session_state.game_turn_state == "AWAITING_GUESS_ANSWER":
+                guess_correctness = prompt
+                
+                # Record the full turn with all the info
+                game.record_turn(
+                    question=st.session_state.current_question,
+                    user_answer=st.session_state.last_answer,
+                    guess=st.session_state.current_guess,
+                    guess_correctness=guess_correctness
+                )
+
+                # Check if the game has ended
+                if game.game_over:
+                    if game.winner == 'ai':
+                        response = f"I win! The word was **'{st.session_state.current_guess}'**. Great game!"
+                    else:  # User wins
+                        response = "You've stumped me after 20 questions! You win!"
+                    
+                    # Reset game state for the next time
+                    st.session_state.game_mode = False
+                    st.session_state.game_turn_state = "START"
+                    game.reset()
+                else:
+                    # If game continues, generate the next question
+                    with st.spinner("Thinking of my next question..."):
+
+                        question = game.generate_question()
+                        st.session_state.current_question = question
+                        response = f"Okay, next round.\n\n**Question {game.questions_asked + 1}:** {question}"
+                        st.session_state.game_turn_state = "AWAITING_QUESTION_ANSWER"
+
+        # ------------------------------------------------------------------
+        # --- Standard Chat / RAG / Web Search Logic ---
+        # ------------------------------------------------------------------
+        else:
+            with st.spinner("Analyzing intent..."):
+                intent = get_intent(prompt)
+                st.info(f"Detected Intent: **{intent}**")
+
+            if intent == 'web_search':
+                with st.spinner("Searching the web and summarizing..."):
+                    search_results_context = search_web(prompt)
+                    summarization_prompt = f"Based ONLY on the following search results, write a concise summary to answer the user's request about '{prompt}'. Synthesize the information into a coherent paragraph.\n\nSearch Results:\n---\n{search_results_context}\n---"
+                    synthesis_response = ollama.chat(
+                        model='mistral',
+                        messages=[{'role': 'user', 'content': summarization_prompt}]
+                    )
+                    response = synthesis_response['message']['content']
+            
+            elif intent == 'play_game':
+                st.session_state.game_mode = True
+                st.session_state.game.reset()
+                st.session_state.game_turn_state = "START"  # Set the initial state for the game
+                response = st.session_state.game.get_initial_message()
+
+            else: # 'chat' intent (includes RAG)
+                with st.spinner("Generating response..."):
+                    context = ""
+                    if st.session_state.rag_db:
+                        context = get_relevant_context(prompt, st.session_state.rag_db)
+                    response = generate_chat_response(st.session_state.messages, prompt, context=context)
+        
+        st.markdown(response)
+        st.session_state.messages.append({"role": "assistant", "content": response})
